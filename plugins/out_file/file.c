@@ -23,13 +23,16 @@
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_time.h>
+#include <fluent-bit/flb_hash.h>
 #include <msgpack.h>
 
 #include <stdio.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-
+#include <monkey/mk_core/mk_list.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
 #include "file.h"
 
 #ifdef FLB_SYSTEM_WINDOWS
@@ -37,6 +40,44 @@
 #else
 #define NEWLINE "\n"
 #endif
+
+#define FILE_MAX 2048
+#define MAX_NAME_LENGTH 256
+
+#define READY 1
+#define BUSY 0
+#define NEW -1
+
+struct queue_message {
+    long type;
+    long sid;
+    char payload[MAX_NAME_LENGTH];
+};
+
+struct reply_message {
+    long success;
+};
+
+struct flb_file_manager {
+    // Files able to be written to.
+    struct flb_hash *status;
+    // Holds list of events to be flushed for each file.
+    struct flb_hash *buffer;
+    // Holds the number of write events that are ready to be flushed to the file.
+    // Each hash table should only include values > 0.
+    struct flb_hash *ready_write_events;
+    // Holds the number of write events waiting to be flushed to the file.
+    struct flb_hash *busy_write_events;
+    // Key use for the message queue.
+    key_t queue_key;
+    int queue_id;
+};
+
+struct flb_output_write {
+    char *path;
+    char *data;
+    struct mk_list _head;
+};
 
 struct flb_file_conf {
     const char *out_path;
@@ -47,7 +88,142 @@ struct flb_file_conf {
     int format;
     int csv_column_names;
     struct flb_output_instance *ins;
+    struct flb_file_manager *manager;
 };
+
+static void set_status(struct flb_file_manager *manager, char *path, int status) {
+    size_t key_size = strlen(path);
+    int *status_ptr = flb_malloc(sizeof(int));
+    *status_ptr = status;
+    flb_hash_add(manager->status, path, key_size, status_ptr, sizeof(int));
+}
+
+static int check_status(struct flb_file_manager *manager, char *path) {
+    size_t key_size = strlen(path);
+    int *status_result = (int*) flb_hash_get_ptr(manager->status, path, key_size);
+    if (status_result == NULL) {
+        set_status(manager, path, READY);
+        return READY;
+    } else {
+        return *status_result;
+    }
+}
+
+static struct flb_file_manager *init_file_manager() {
+    struct flb_file_manager *manager;
+    manager = flb_malloc(sizeof(struct flb_file_manager));
+    manager->buffer = flb_hash_create(FLB_HASH_EVICT_LESS_USED, 8192, -1);
+    manager->status = flb_hash_create(FLB_HASH_EVICT_LESS_USED, 8192, -1);
+    manager->ready_write_events = flb_hash_create(FLB_HASH_EVICT_LESS_USED, 8192, -1);
+    manager->busy_write_events = flb_hash_create(FLB_HASH_EVICT_LESS_USED, 8192, -1);
+
+    manager->queue_key = ftok("/tmp/FLB_FILE_OUTPUT_PLUGIN", 0);
+
+    flb_info("queue_key %d", manager->queue_key);
+    manager->queue_id = msgget(manager->queue_key, 0666 | IPC_CREAT);
+    flb_info("queue_id %d", manager->queue_id);
+
+    return manager;
+}
+
+static void file_buffer_append(struct flb_file_manager *manager, struct flb_output_write *write) {
+    struct mk_list *head;
+    size_t key_size = strlen(write->path);
+
+    // First add it to the buffer/write-queue.
+    head = (struct mk_list*) flb_hash_get_ptr(manager->buffer, write->path, key_size);
+    if (head == NULL) {
+        flb_hash_add(manager->buffer, write->path, key_size, write, sizeof(struct mk_list));
+        head = (struct mk_list*) flb_hash_get_ptr(manager->buffer, write->path, key_size);
+        mk_list_init(head);
+    }
+    mk_list_add(&write->_head, head);
+}
+
+static void modify_write_count(struct flb_file_manager *manager, char *path, int val) {
+    size_t key_size = strlen(path);
+
+    int status = check_status(manager, path);
+    struct flb_hash *hash = status == READY ? manager->ready_write_events : manager->busy_write_events;
+    int *count = flb_hash_get_ptr(manager->ready_write_events, path, key_size);
+    if (count == NULL) {
+        int *zero = flb_malloc(sizeof(int));
+        *zero = 0;
+        flb_hash_add(hash, path, key_size, zero, sizeof(int));
+    }
+    count = flb_hash_get_ptr(manager->ready_write_events, path, key_size);
+    *count += val;
+    assert(*count >= 0);
+    if (*count == 0) {
+        flb_hash_del(hash, path);
+    }
+}
+
+static void swap_write_count(struct flb_file_manager *manager, char *path) {
+    size_t key_size = strlen(path);
+
+    int status = check_status(manager, path);
+    struct flb_hash *hash = status == READY ? manager->ready_write_events : manager->busy_write_events;
+    int *count = flb_hash_get_ptr(hash, path, key_size);
+    // NOP trying to swap the write count if there are no writes listed.
+    if (count == NULL) {
+        return;
+    }
+    if (status == READY) {
+        flb_hash_add(manager->busy_write_events, path, key_size, count, sizeof(int));
+        flb_hash_del(hash, path);
+    } else {
+        flb_hash_add(manager->ready_write_events, path, key_size, count, sizeof(int));
+        flb_hash_del(hash, path);
+    }
+}
+
+// Fetch the next write event ready to be flushed.
+static struct flb_output_write *file_get_append(struct flb_file_manager *manager) {
+    struct flb_output_write *head;
+    return head;
+}
+
+// Fetch the next write event for file *path whic is ready to be flushed.
+static struct flb_output_write *file_get_path_append(struct flb_file_manager *manager, char *path) {
+    struct mk_list *head;
+    size_t key_size = strlen(path);
+
+    head = (struct mk_list*) flb_hash_get_ptr(manager->buffer, path, key_size);
+    if (head == NULL) {
+        return NULL;
+    }
+    struct flb_output_write *write = mk_list_entry_first(head, struct flb_output_write, _head);
+
+    return write;
+}
+
+// Get the most recent write event for file *path.
+static struct flb_output_write *file_get_last_append(struct flb_file_manager *manager, char *path) {
+    struct mk_list *head;
+    size_t key_size = strlen(path);
+
+    head = (struct mk_list*) flb_hash_get_ptr(manager->buffer, path, key_size);
+    if (head == NULL) {
+        return NULL;
+    }
+    struct flb_output_write *write = mk_list_entry_last(head, struct flb_output_write, _head);
+
+    return write;
+}
+
+// Updates all data structures.
+static int file_pause_appends(struct flb_file_manager *manager, char *path) {
+    return 0;
+}
+
+static int file_resume_appends(struct flb_file_manager *manager) {
+    return 0;
+}
+
+static int file_append_paused(struct flb_file_manager *manager, char *path) {
+    return 0;
+}
 
 static char *check_delimiter(const char *str)
 {
@@ -90,7 +266,7 @@ static int cb_file_init(struct flb_output_instance *ins,
     ctx->delimiter = NULL;
     ctx->label_delimiter = NULL;
     ctx->template = NULL;
-
+    ctx->manager = init_file_manager();
     ret = flb_output_config_map_set(ins, (void *) ctx);
     if (ret == -1) {
         flb_free(ctx);
@@ -409,6 +585,22 @@ static void cb_file_flush(const void *data, size_t bytes,
         FLB_OUTPUT_RETURN(FLB_OK);
     }
 
+    struct queue_message msg;
+    int qid = ctx->manager->queue_id;
+    if (qid == -1) {
+        perror("ctx->manager->queue_id");
+    }
+    if (msgrcv(qid, &msg, sizeof(struct queue_message), 0, IPC_NOWAIT) <= 0) {
+        flb_info("No msgrcv.");
+    } else {
+        flb_info("msgrcv: %s %d %s", &msg.type, msg.sid, &msg.payload);
+        // Reply.
+        struct reply_message reply;
+        reply.success = 1;
+        if (msgsnd(msg.sid, &reply, sizeof(struct reply_message), 0) == -1) {
+            perror("server::reply");
+        }
+    }
     /*
      * Upon flush, for each array, lookup the time and the first field
      * of the map to use as a data point.
@@ -423,6 +615,27 @@ static void cb_file_flush(const void *data, size_t bytes,
         switch (ctx->format){
         case FLB_OUT_FILE_FMT_JSON:
             buf = flb_msgpack_to_json_str(alloc_size, obj);
+            struct flb_output_write *write;
+            write = flb_malloc(sizeof(struct flb_output_write));
+
+            char *write_path;
+            write_path = flb_malloc(sizeof(out_file));
+            memcpy(write_path, &out_file, sizeof(out_file));
+            write->path = write_path;
+
+            char *write_buf;
+            write_buf = flb_malloc(alloc_size);
+            memcpy(write_buf, buf, alloc_size);
+            write->data = write_buf;
+
+            file_buffer_append(ctx->manager, write);
+            struct flb_output_write *append = file_get_path_append(ctx->manager, write->path);
+            struct flb_output_write *last= file_get_last_append(ctx->manager, write->path);
+
+            flb_info("head: %s tail %s", append->data, last->data);
+
+            int status = check_status(ctx->manager, write->path);
+            flb_info("path: %s status: %i", write->path, status);
             if (buf) {
                 fprintf(fp, "%s: [%"PRIu64".%09lu, %s]" NEWLINE,
                         tag_buf,

@@ -48,6 +48,9 @@
 #define BUSY 0
 #define NEW -1
 
+#define mk_list_foreach_debug(curr, head) for( curr = (head)->next; curr != (head); curr = curr->next )
+static void debug();
+
 struct queue_message {
     long type;
     long sid;
@@ -68,9 +71,15 @@ struct flb_file_manager {
     struct flb_hash *ready_write_events;
     // Holds the number of write events waiting to be flushed to the file.
     struct flb_hash *busy_write_events;
+    // Holds a reference to an entry in the circular_write_buffer.
+    struct flb_hash *circular_write_map;
+    // Each entry holds a reference to the oldest write event to some file.
+    struct mk_list circular_write_buffer;
+
     // Key use for the message queue.
     key_t queue_key;
     int queue_id;
+
 };
 
 struct flb_output_write {
@@ -109,6 +118,15 @@ static int check_status(struct flb_file_manager *manager, char *path) {
     }
 }
 
+static void stage_write(struct flb_file_manager *manager, struct flb_output_write *write) {
+    if (write == NULL) {
+        return;
+    }
+    flb_info("stage: [path]: %s [data]: %s | [node]: %p, [prev]: %p, [next]: %p", write->path, write->data, &write->_head, &write->_head.prev, &write->_head.next);
+    mk_list_add(&write->_head, &manager->circular_write_buffer);
+    flb_hash_add(manager->circular_write_map, write->path, strlen(write->path), write, sizeof(struct flb_output_write *));
+}
+
 static struct flb_file_manager *init_file_manager() {
     struct flb_file_manager *manager;
     manager = flb_malloc(sizeof(struct flb_file_manager));
@@ -116,12 +134,12 @@ static struct flb_file_manager *init_file_manager() {
     manager->status = flb_hash_create(FLB_HASH_EVICT_LESS_USED, 8192, -1);
     manager->ready_write_events = flb_hash_create(FLB_HASH_EVICT_LESS_USED, 8192, -1);
     manager->busy_write_events = flb_hash_create(FLB_HASH_EVICT_LESS_USED, 8192, -1);
+    manager->circular_write_map = flb_hash_create(FLB_HASH_EVICT_LESS_USED, 8182, -1);
+    mk_list_init(&manager->circular_write_buffer);
 
     manager->queue_key = ftok("/tmp/FLB_FILE_OUTPUT_PLUGIN", 0);
 
-    flb_info("queue_key %d", manager->queue_key);
     manager->queue_id = msgget(manager->queue_key, 0666 | IPC_CREAT);
-    flb_info("queue_id %d", manager->queue_id);
 
     return manager;
 }
@@ -130,14 +148,20 @@ static void file_buffer_append(struct flb_file_manager *manager, struct flb_outp
     struct mk_list *head;
     size_t key_size = strlen(write->path);
 
-    // First add it to the buffer/write-queue.
-    head = (struct mk_list*) flb_hash_get_ptr(manager->buffer, write->path, key_size);
-    if (head == NULL) {
-        flb_hash_add(manager->buffer, write->path, key_size, write, sizeof(struct mk_list));
+    // If there is no write for the target file in the circular_buffer, add it directly. 
+    struct flb_output_write *staged_write = flb_hash_get_ptr(manager->circular_write_map, write->path, key_size);
+    if (staged_write == NULL) {
+        stage_write(manager, write);
+    } else {
+        // Else add it to the buffer/write-queue.
         head = (struct mk_list*) flb_hash_get_ptr(manager->buffer, write->path, key_size);
-        mk_list_init(head);
+        if (head == NULL) {
+            head = flb_malloc(sizeof(struct mk_list));
+            mk_list_init(head);
+            flb_hash_add(manager->buffer, write->path, key_size, head, 0);
+        }
+        mk_list_add(&write->_head, head);
     }
-    mk_list_add(&write->_head, head);
 }
 
 static void modify_write_count(struct flb_file_manager *manager, char *path, int val) {
@@ -180,11 +204,29 @@ static void swap_write_count(struct flb_file_manager *manager, char *path) {
 
 // Fetch the next write event ready to be flushed.
 static struct flb_output_write *file_get_append(struct flb_file_manager *manager) {
-    struct flb_output_write *head;
-    return head;
+
+    if (mk_list_size(&manager->circular_write_buffer) == 0) {
+        return NULL;
+    }
+
+    struct flb_output_write *write = mk_list_entry_first(&manager->circular_write_buffer, struct flb_output_write, _head);
+    mk_list_del(&write->_head);
+    flb_hash_del(manager->circular_write_map, write->path);
+    // Now check if there is a new write to replace it.
+    struct mk_list *list = (struct mk_list *)flb_hash_get_ptr(manager->buffer, write->path, strlen(write->path));
+    if (list != NULL) {
+        // Stage the next write.
+
+        struct flb_output_write *to_stage = (struct flb_output_write *) mk_list_entry_first(list, struct flb_output_write, _head);
+        mk_list_del(&to_stage->_head);
+        stage_write(manager, to_stage);
+
+    }
+
+    return write;
 }
 
-// Fetch the next write event for file *path whic is ready to be flushed.
+// Fetch the next write event for file *path which is ready to be flushed.
 static struct flb_output_write *file_get_path_append(struct flb_file_manager *manager, char *path) {
     struct mk_list *head;
     size_t key_size = strlen(path);
@@ -212,17 +254,40 @@ static struct flb_output_write *file_get_last_append(struct flb_file_manager *ma
     return write;
 }
 
-// Updates all data structures.
+static int file_append_status(struct flb_file_manager *manager, char *path, int status) {
+    size_t key_size = strlen(path);
+
+    struct mk_list *head = (struct mk_list*) flb_hash_get_ptr(manager->buffer, path, key_size);
+    if (head == NULL) {
+        return 0;
+    }
+    //swap_write_count(manager, path);
+    set_status(manager, path, status);
+
+    return 1;
+}
+
+// Updates data-structures to signal that the file mapped by 'path' is not actively appended too.
 static int file_pause_appends(struct flb_file_manager *manager, char *path) {
-    return 0;
+    int append_status = file_append_status(manager, path, BUSY);
+    if (!append_status) {
+        return -1;
+    }
+    struct flb_output_write *write = flb_hash_get_ptr(manager->circular_write_map, path, strlen(path));
+    mk_list_del(&write->_head);
+    return append_status;
 }
 
-static int file_resume_appends(struct flb_file_manager *manager) {
-    return 0;
-}
-
-static int file_append_paused(struct flb_file_manager *manager, char *path) {
-    return 0;
+// Updates data-structures to signal that the file mapped by 'path' is actively appended too.
+static int file_resume_appends(struct flb_file_manager *manager, char *path) {
+    int append_status = file_append_status(manager, path, READY);
+    if (!append_status) {
+        return -1;
+    }
+    struct flb_output_write *write = flb_hash_get_ptr(manager->circular_write_map, path, strlen(path));
+    mk_list_init(&write->_head);
+    mk_list_add(&write->_head, &manager->circular_write_buffer);
+    return append_status;
 }
 
 static char *check_delimiter(const char *str)
@@ -244,7 +309,6 @@ static char *check_delimiter(const char *str)
     return NULL;
 }
 
-
 static int cb_file_init(struct flb_output_instance *ins,
                         struct flb_config *config,
                         void *data)
@@ -256,6 +320,7 @@ static int cb_file_init(struct flb_output_instance *ins,
     (void) data;
     struct flb_file_conf *ctx;
 
+    debug();
     ctx = flb_calloc(1, sizeof(struct flb_file_conf));
     if (!ctx) {
         flb_errno();
@@ -494,6 +559,70 @@ static int plain_output(FILE *fp, msgpack_object *obj, size_t alloc_size)
     return 0;
 }
 
+static void print_circular_buffer(struct flb_file_manager *manager) {
+    struct mk_list *head;
+    flb_info("[print-circular-buffer]:");
+    mk_list_foreach(head, &manager->circular_write_buffer) {
+        struct flb_output_write *item = mk_list_entry(head, struct flb_output_write, _head);
+        flb_info("\t[path]: %s [data]: %s", item->path, item->data);
+    }
+    flb_info("");
+}
+
+static void print_write_buffer(struct flb_file_manager *manager, char *path) {
+    struct mk_list *head;
+
+    int limit = 10;
+    size_t key_size = strlen(path);
+    struct mk_list *queue = (struct mk_list *) flb_hash_get_ptr(manager->buffer, path, key_size);
+    flb_info("[print-write-buffer]:");
+    if (queue != NULL) {
+        int count = 0;
+        mk_list_foreach(head, queue) {
+            struct flb_output_write *item = mk_list_entry(head, struct flb_output_write, _head);
+            flb_info("\t[path]: %s [data]: %s", item->path, item->data);
+            count += 1;
+            if (count > limit) {
+                break;
+            }
+        }
+    }
+    flb_info("");
+}
+
+
+static void debug() {
+    struct flb_file_manager *manager;
+    manager = init_file_manager();
+
+    struct flb_output_write a0 = { "a.log", "a0" };
+    struct flb_output_write a1 = { "a.log", "a1" };
+    struct flb_output_write a2 = { "a.log", "a2" };
+    struct flb_output_write a3 = { "a.log", "a3" };
+
+    file_buffer_append(manager, &a0);
+    print_write_buffer(manager, "a.log");
+    print_circular_buffer(manager);
+    file_buffer_append(manager, &a1);
+    print_write_buffer(manager, "a.log");
+    print_circular_buffer(manager);
+    file_buffer_append(manager, &a2);
+    print_write_buffer(manager, "a.log");
+    print_circular_buffer(manager);
+    file_buffer_append(manager, &a3);
+    print_write_buffer(manager, "a.log");
+    print_circular_buffer(manager);
+    struct flb_output_write b1 = { "b.log", "b1" };
+    file_buffer_append(manager, &b1);
+    print_write_buffer(manager, "b.log");
+    print_circular_buffer(manager);
+
+    struct flb_output_write *write = file_get_append(manager);
+    flb_info("write: %s -> %s", write->path, write->data);
+    print_circular_buffer(manager);
+    print_write_buffer(manager, "a.log");
+}
+
 static void cb_file_flush(const void *data, size_t bytes,
                           const char *tag, int tag_len,
                           struct flb_input_instance *i_ins,
@@ -591,7 +720,7 @@ static void cb_file_flush(const void *data, size_t bytes,
         perror("ctx->manager->queue_id");
     }
     if (msgrcv(qid, &msg, sizeof(struct queue_message), 0, IPC_NOWAIT) <= 0) {
-        flb_info("No msgrcv.");
+        flb_info("no msgrcv.");
     } else {
         flb_info("msgrcv: %s %d %s", &msg.type, msg.sid, &msg.payload);
         // Reply.
@@ -629,13 +758,17 @@ static void cb_file_flush(const void *data, size_t bytes,
             write->data = write_buf;
 
             file_buffer_append(ctx->manager, write);
-            struct flb_output_write *append = file_get_path_append(ctx->manager, write->path);
-            struct flb_output_write *last= file_get_last_append(ctx->manager, write->path);
-
-            flb_info("head: %s tail %s", append->data, last->data);
 
             int status = check_status(ctx->manager, write->path);
-            flb_info("path: %s status: %i", write->path, status);
+            print_circular_buffer(ctx->manager);
+            print_write_buffer(ctx->manager, write->path);
+
+            struct mk_list *head = (struct mk_list*) flb_hash_get_ptr(ctx->manager->buffer, write->path, strlen(write->path));
+            if (head != NULL && mk_list_size(head) > 1) {
+                struct flb_output_write *flush = file_get_append(ctx->manager);
+                flb_info("[flush]: %s -> %s", flush->data, flush->path);
+            }
+
             if (buf) {
                 fprintf(fp, "%s: [%"PRIu64".%09lu, %s]" NEWLINE,
                         tag_buf,

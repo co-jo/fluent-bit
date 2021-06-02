@@ -122,7 +122,8 @@ static void stage_write(struct flb_file_manager *manager, struct flb_output_writ
     if (write == NULL) {
         return;
     }
-    flb_info("stage: [path]: %s [data]: %s | [node]: %p, [prev]: %p, [next]: %p", write->path, write->data, &write->_head, &write->_head.prev, &write->_head.next);
+    //flb_info("stage: [write] %p, [head]: %p", write, write->_head);
+    //flb_info("stage: [path]: %s [data]: %s | [node]: %p, [prev]: %p, [next]: %p", write->path, write->data, &write->_head, &write->_head.prev, &write->_head.next);
     mk_list_add(&write->_head, &manager->circular_write_buffer);
     flb_hash_add(manager->circular_write_map, write->path, strlen(write->path), write, sizeof(struct flb_output_write *));
 }
@@ -214,13 +215,11 @@ static struct flb_output_write *file_get_append(struct flb_file_manager *manager
     flb_hash_del(manager->circular_write_map, write->path);
     // Now check if there is a new write to replace it.
     struct mk_list *list = (struct mk_list *)flb_hash_get_ptr(manager->buffer, write->path, strlen(write->path));
-    if (list != NULL) {
+    if (mk_list_size(list) > 0) {
         // Stage the next write.
-
         struct flb_output_write *to_stage = (struct flb_output_write *) mk_list_entry_first(list, struct flb_output_write, _head);
         mk_list_del(&to_stage->_head);
         stage_write(manager, to_stage);
-
     }
 
     return write;
@@ -320,7 +319,7 @@ static int cb_file_init(struct flb_output_instance *ins,
     (void) data;
     struct flb_file_conf *ctx;
 
-    debug();
+    //debug();
     ctx = flb_calloc(1, sizeof(struct flb_file_conf));
     if (!ctx) {
         flb_errno();
@@ -599,6 +598,8 @@ static void debug() {
     struct flb_output_write a1 = { "a.log", "a1" };
     struct flb_output_write a2 = { "a.log", "a2" };
     struct flb_output_write a3 = { "a.log", "a3" };
+    struct flb_output_write a4 = { "a.log", "a4" };
+    struct flb_output_write a5 = { "a.log", "a5" };
 
     file_buffer_append(manager, &a0);
     print_write_buffer(manager, "a.log");
@@ -611,14 +612,22 @@ static void debug() {
     print_circular_buffer(manager);
     file_buffer_append(manager, &a3);
     print_write_buffer(manager, "a.log");
-    print_circular_buffer(manager);
-    struct flb_output_write b1 = { "b.log", "b1" };
-    file_buffer_append(manager, &b1);
-    print_write_buffer(manager, "b.log");
-    print_circular_buffer(manager);
+    //print_circular_buffer(manager);
+    //struct flb_output_write b1 = { "b.log", "b1" };
+    //file_buffer_append(manager, &b1);
+    //print_write_buffer(manager, "b.log");
+    //print_circular_buffer(manager);
 
-    struct flb_output_write *write = file_get_append(manager);
-    flb_info("write: %s -> %s", write->path, write->data);
+    //struct flb_output_write *write = file_get_append(manager);
+    struct flb_output_write *write0 = file_get_append(manager);
+    struct flb_output_write *write1 = file_get_append(manager);
+    struct flb_output_write *write2 = file_get_append(manager);
+    struct flb_output_write *write3 = file_get_append(manager);
+    //flb_info("write: %s -> %s", write->path, write->data);
+    print_circular_buffer(manager);
+    print_write_buffer(manager, "a.log");
+    file_buffer_append(manager, &a4);
+    file_buffer_append(manager, &a5);
     print_circular_buffer(manager);
     print_write_buffer(manager, "a.log");
 }
@@ -714,19 +723,16 @@ static void cb_file_flush(const void *data, size_t bytes,
         FLB_OUTPUT_RETURN(FLB_OK);
     }
 
-    struct queue_message msg;
+    struct queue_message *msg = flb_malloc(sizeof(struct queue_message));
     int qid = ctx->manager->queue_id;
     if (qid == -1) {
-        perror("ctx->manager->queue_id");
+        perror("manager->queue_id == -1");
     }
-    if (msgrcv(qid, &msg, sizeof(struct queue_message), 0, IPC_NOWAIT) <= 0) {
-        flb_info("no msgrcv.");
-    } else {
-        flb_info("msgrcv: %s %d %s", &msg.type, msg.sid, &msg.payload);
+    if (msgrcv(qid, msg, sizeof(struct queue_message), 0, IPC_NOWAIT) > 0) {
         // Reply.
         struct reply_message reply;
         reply.success = 1;
-        if (msgsnd(msg.sid, &reply, sizeof(struct reply_message), 0) == -1) {
+        if (msgsnd(msg->sid, &reply, sizeof(struct reply_message), 0) == -1) {
             perror("server::reply");
         }
     }
@@ -760,13 +766,10 @@ static void cb_file_flush(const void *data, size_t bytes,
             file_buffer_append(ctx->manager, write);
 
             int status = check_status(ctx->manager, write->path);
-            print_circular_buffer(ctx->manager);
-            print_write_buffer(ctx->manager, write->path);
 
             struct mk_list *head = (struct mk_list*) flb_hash_get_ptr(ctx->manager->buffer, write->path, strlen(write->path));
             if (head != NULL && mk_list_size(head) > 1) {
                 struct flb_output_write *flush = file_get_append(ctx->manager);
-                flb_info("[flush]: %s -> %s", flush->data, flush->path);
             }
 
             if (buf) {

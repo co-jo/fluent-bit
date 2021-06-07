@@ -638,23 +638,24 @@ static void free_write(struct flb_output_write *write) {
     flb_free(write);
 }
 
-static struct flb_output_write* create_write(char *path, size_t path_size, msgpack_object *data, size_t data_size, char *tag, struct flb_time *time) {
+static struct flb_output_write* create_write(char *path, size_t path_size, msgpack_object *data, size_t data_size, char *tag, size_t tag_len, struct flb_time *time) {
     struct flb_output_write *write = flb_malloc(sizeof(struct flb_output_write));
 
     write->data_size = data_size;
     write->data = msgpack_copy(data);
 
     write->path_size = path_size;
-    write->path = flb_malloc(path_size);
+    write->path = flb_malloc(path_size+1);
     memcpy(write->path, path, path_size);
+    write->path[path_size] = '\0';
 
     size_t time_size = sizeof(struct flb_time);
     write->time = flb_malloc(time_size);
     memcpy(write->time, time, time_size);
 
-    size_t tag_len = strlen(tag);
-    write->tag = flb_malloc(tag_len);
+    write->tag = flb_malloc(tag_len+1);
     memcpy(write->tag, tag, tag_len);
+    write->tag[tag_len] = '\0';
 
     return write;
 }
@@ -666,7 +667,7 @@ static void process_message_queue(struct flb_file_conf *ctx) {
         perror("manager->queue_id == -1");
     }
     // Clear queue on each flush attempt.
-    while (msgrcv(qid, msg, sizeof(struct queue_message), 0, IPC_NOWAIT) > 0) {
+    while (msgrcv(qid, msg, sizeof(struct queue_message) - sizeof(long), 0, IPC_NOWAIT) > 0) {
         // Reply.
         flb_info("Received %s (%d) request for '%s'.", msg->type == 1 ? "resume" : "pause", msg->type, msg->payload);
 
@@ -681,7 +682,7 @@ static void process_message_queue(struct flb_file_conf *ctx) {
         struct reply_message reply;
         reply.success = 1;
         if (msgsnd(msg->sid, &reply, sizeof(struct reply_message), 0) == -1) {
-            flb_error("Failed to send reply message to client queue.");
+            flb_warn("Failed to send reply message to client queue (id: %ld).", msg->sid);
         }
     }
     flb_free(msg);
@@ -782,7 +783,7 @@ static void cb_file_flush(const void *data, size_t bytes,
 
         flb_time_pop_from_msgpack(&tm, &result, &obj);
         
-        struct flb_output_write *write = create_write(out_file, out_size, obj, alloc_size, tag_buf, &tm);
+        struct flb_output_write *write = create_write(out_file, out_size, obj, alloc_size, tag_buf, tag_len, &tm);
 
         file_buffer_append(ctx->manager, write);
         struct flb_output_write *flush = file_get_append(ctx->manager);
